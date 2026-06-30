@@ -1,30 +1,29 @@
 -- frame_client.lua
--- Three separate responsibilities:
---   1. POLL  — always running, reads state, updates local truth, never writes
---   2. CMD   — fire and forget, write only, no callback, no readback
---   3. FOCUS — determines whose commands are authoritative
-
 local uv = vim.uv or vim.loop
 local M = {}
 
 local HOST = '127.0.0.1'
 local PORT = 4242
+local PAD_ROWS = 500
 
--- ── shared state (poll is the only thing that writes to this) ─────────────────
 local state = {
   current_time = 0,
   current_dim = 0,
   frame_count = 0,
   dim_count = 0,
-  frames = {}, -- [n] = { uid=hex_str, dims={...} }
+  frames = {},
 }
 
+local painted = false
+local last_sig = nil
 local ble_buf = nil
 local ble_ns = vim.api.nvim_create_namespace 'ble'
 local ble_focused = false
-local moving = false -- true while poll is repositioning cursor
+local expect_cursor = nil
 local playing = false
 local play_timer = nil
+local last_sent_time = nil
+local last_sent_dim = nil
 
 -- ── debug ─────────────────────────────────────────────────────────────────────
 local log_path = '/tmp/ble_debug.log'
@@ -39,8 +38,9 @@ local function dbg(msg)
   end)
 end
 
--- ── CMD: fire and forget, no callback ─────────────────────────────────────────
+-- ── CMD: fire and forget ──────────────────────────────────────────────────────
 local function cmd(msg)
+  dbg('SEND ' .. msg:gsub('\n', '')) -- ← first line inside cmd, in the file
   local c = uv.new_tcp()
   c:connect(HOST, PORT, function(err)
     if err then
@@ -48,7 +48,7 @@ local function cmd(msg)
       c:close()
       return
     end
-    c:read_start(function(_, _) end) -- drain so server doesn't block
+    c:read_start(function(_, _) end)
     c:write(msg)
     c:shutdown(function()
       c:close()
@@ -56,128 +56,198 @@ local function cmd(msg)
   end)
 end
 
--- ── helpers ──────────────────────────────────────────────────────────────────
-
--- word N in a line starts at col N * (TOKEN_WIDTH+1)
--- we use fixed-width tokens so col math is simple
--- col_to_dim: cursor col → dim index
--- line layout: frame_idx  main  dim0  dim1 ...
---              word 0      1     2     3
--- dim index = word_index - 2  (word 0 and 1 are not dims)
-local function col_to_dim(col, line)
-  if not line then
-    return 0
+-- ── column math ───────────────────────────────────────────────────────────────
+local function each_word(line, fn)
+  for s, w in line:gmatch '()(%S+)' do
+    fn(s - 1, w)
   end
-  local pos = 0
-  local word_idx = 0
-  for w in line:gmatch '%S+' do
-    local wend = pos + #w
-    if col <= wend then
-      return math.max(0, word_idx - 2)
-    end
-    pos = wend + 1
-    word_idx = word_idx + 1
-  end
-  return math.max(0, word_idx - 2)
 end
 
--- dim_to_col: dim index → start col of that word
--- dim 0 → word 2, dim 1 → word 3, etc.
+-- returns a dim index (0-based), 'main' for the main column, or nil
+local function col_to_dim(col, line)
+  if not line then
+    return nil
+  end
+  local seen_colon = false
+  local colon_col = nil
+  local dim_idx = 0
+  local result = nil
+  each_word(line, function(c0, w)
+    if result ~= nil then
+      return
+    end
+    if w == ':' then
+      seen_colon = true
+      colon_col = c0
+      return
+    end
+    if seen_colon then
+      local wend = c0 + #w
+      if col < wend then
+        result = dim_idx
+        return
+      end
+      dim_idx = dim_idx + 1
+    end
+  end)
+  if not seen_colon then
+    return nil
+  end
+  -- cursor left of the ':' → main column, scrub time + snap to owner
+  if colon_col and col < colon_col then
+    return 'main'
+  end
+  if result ~= nil then
+    return result
+  end
+  return math.max(0, dim_idx - 1)
+end
+
 local function dim_to_col(d, line)
   if not line then
     return 0
   end
-  local target = d + 2 -- skip frame_idx and main
-  local i = 0
-  local pos = 0
-  for w in line:gmatch '%S+' do
-    if i == target then
-      return pos
+  local seen_colon = false
+  local dim_idx = 0
+  local result = nil
+  each_word(line, function(c0, w)
+    if result ~= nil then
+      return
     end
-    pos = pos + #w + 1
-    i = i + 1
-  end
-  return pos
+    if seen_colon then
+      if dim_idx == d then
+        result = c0
+        return
+      end
+      dim_idx = dim_idx + 1
+    end
+    if w == ':' then
+      seen_colon = true
+    end
+  end)
+  return result or 0
 end
 
--- rewrite .ble buffer: one line per frame, hex uids space-separated
--- frame_uid dim0_uid dim1_uid ...
+-- ── render ─────────────────────────────────────────────────────────────────────
+local function tok(v)
+  return (v and v ~= 'null') and ('[' .. v .. ']') or '[x]'
+end
+
+local function frames_sig()
+  local parts = { tostring(state.frame_count), tostring(state.dim_count), tostring(state.current_dim) }
+  for i = 1, state.frame_count do
+    local fr = state.frames[i]
+    parts[#parts + 1] = (fr and fr.uid) or 'n'
+    if fr then
+      parts[#parts + 1] = table.concat(fr.dims, ',')
+    end
+  end
+  return table.concat(parts, '|')
+end
+
 local function update_ble_buf()
   if not ble_buf or not vim.api.nvim_buf_is_valid(ble_buf) then
     return
   end
   local fc = state.frame_count
   local dc = state.dim_count
-  local function tok(v)
-    return (v and v ~= 'null') and ('0x' .. v) or 'null'
-  end
-  local lines = {}
+
+  local rows = {}
   for i = 1, fc do
     local fr = state.frames[i]
-    local main = tok(fr and fr.uid)
-    local dims = {}
+    local row = { tostring(i - 1), tok(fr and fr.uid) }
     for j = 1, dc do
-      table.insert(dims, tok(fr and fr.dims[j]))
+      row[#row + 1] = tok(fr and fr.dims[j])
     end
-    table.insert(lines, tostring(i - 1) .. ' ' .. main .. ' : ' .. table.concat(dims, ' '))
+    rows[#rows + 1] = row
   end
-  -- 500 line buffer past end for new frame entry
-  for i = fc, fc + 499 do
-    local dims = {}
+  for i = fc, fc + PAD_ROWS - 1 do
+    local row = { tostring(i), 'null' }
     for _ = 1, dc do
-      table.insert(dims, 'null')
+      row[#row + 1] = 'null'
     end
-    table.insert(lines, tostring(i) .. ' null : ' .. table.concat(dims, ' '))
+    rows[#rows + 1] = row
   end
-  moving = true
+
+  local widths = {}
+  for _, row in ipairs(rows) do
+    for c, cell in ipairs(row) do
+      widths[c] = math.max(widths[c] or 0, #cell)
+    end
+  end
+  local function pad(s, w)
+    return s .. string.rep(' ', w - #s)
+  end
+
+  local lines = {}
+  for _, row in ipairs(rows) do
+    local parts = { pad(row[1], widths[1]), pad(row[2], widths[2]), ':' }
+    for c = 3, #row do
+      parts[#parts + 1] = pad(row[c], widths[c])
+    end
+    lines[#lines + 1] = table.concat(parts, ' ')
+  end
+
+  local win = vim.fn.bufwinid(ble_buf)
+  local before = (win ~= -1) and vim.api.nvim_win_get_cursor(win) or nil
+
   vim.api.nvim_buf_set_lines(ble_buf, 0, -1, false, lines)
 
-  -- highlights: main uid and selected dim column
   vim.api.nvim_buf_clear_namespace(ble_buf, ble_ns, 0, -1)
-  for i, line in ipairs(lines) do
-    local row = i - 1
-    -- highlight main token (word 1, after frame index)
-    local main_s, main_e = line:find('%S+', line:find ' ' + 1)
-    if main_s then
-      vim.api.nvim_buf_add_highlight(ble_buf, ble_ns, 'DiagnosticInfo', row, main_s - 1, main_e)
+  for li, line in ipairs(lines) do
+    local row = li - 1
+    local words = {}
+    each_word(line, function(c0, w)
+      words[#words + 1] = { col = c0, e = c0 + #w, w = w }
+    end)
+
+    if words[2] and words[2].w ~= '[x]' then
+      vim.api.nvim_buf_add_highlight(ble_buf, ble_ns, 'DiagnosticInfo', row, words[2].col, words[2].e)
     end
-    -- highlight selected dim column (word 3 + current_dim, skipping ' : ')
-    local colon = line:find ': '
-    if colon then
-      local after = colon + 2
-      local wi = 0
-      local s, e = after, after
-      while true do
-        local ws, we = line:find('%S+', s)
-        if not ws then
-          break
-        end
-        if wi == state.current_dim then
-          vim.api.nvim_buf_add_highlight(ble_buf, ble_ns, 'DiagnosticWarn', row, ws - 1, we)
-          break
-        end
-        wi = wi + 1
-        s = we + 1
+
+    local colon_i = nil
+    for wi, wd in ipairs(words) do
+      if wd.w == ':' then
+        colon_i = wi
+        break
+      end
+    end
+    if colon_i then
+      local target = words[colon_i + 1 + state.current_dim]
+      if target and target.w ~= '[x]' then
+        vim.api.nvim_buf_add_highlight(ble_buf, ble_ns, 'DiagnosticWarn', row, target.col, target.e)
       end
     end
   end
 
-  vim.schedule(function()
-    vim.schedule(function()
-      moving = false
-    end)
-  end)
+  if win ~= -1 then
+    local target_row = state.current_time + 1
+    local col = before and before[2] or 0
+    local linecount = vim.api.nvim_buf_line_count(ble_buf)
+    if target_row >= 1 and target_row <= linecount then
+      vim.api.nvim_win_set_cursor(win, { target_row, col })
+      expect_cursor = { target_row, col }
+    end
+  end
 end
 
--- ── POLL: one in flight at a time, updates state{}, moves cursor if needed ────
+-- ── POLL ────────────────────────────────────────────────────────────────────
 local function poll_loop()
   local c = uv.new_tcp()
   local buf = ''
+
+  local function retry()
+    local timer = uv.new_timer()
+    timer:start(150, 0, function()
+      timer:close()
+      poll_loop()
+    end)
+  end
+
   c:connect(HOST, PORT, function(err)
     if err then
       dbg('poll connect error: ' .. tostring(err))
       c:close()
-      -- retry after delay
       local t = uv.new_timer()
       t:start(500, 0, function()
         t:close()
@@ -191,96 +261,93 @@ local function poll_loop()
         c:close()
         return
       end
-      if data then
-        buf = buf .. data
-        if not buf:find '%-%-%-\n' then
-          return
-        end
+      if not data then
         c:close()
-
-        -- parse state
-        local t = tonumber(buf:match 'current_time=(%d+)')
-        local d = tonumber(buf:match 'current_dim=(%d+)')
-        local fc = tonumber(buf:match 'frame_count=(%d+)')
-        local dc = tonumber(buf:match 'current_dim_count=(%d+)')
-        if t ~= nil then
-          local time_changed = (t ~= state.current_time)
-          local dim_changed = (d ~= state.current_dim)
-          state.current_time = t
-          state.current_dim = d or state.current_dim
-          if fc then
-            state.frame_count = fc
-          end
-          if dc then
-            state.dim_count = dc
-          end
-
-          -- parse frames table: frame_begin + dim_option lines
-          local frames = {}
-          local fi = 0
-          for line in buf:gmatch '[^\n]+' do
-            local uid = line:match '^frame_begin=(%x+)'
-            if uid then
-              fi = fi + 1
-              frames[fi] = { uid = uid, dims = {} }
-            end
-            local dim_val = line:match '^dim_option=(.+)'
-            if dim_val and fi > 0 then
-              table.insert(frames[fi].dims, dim_val)
-            end
-          end
-          state.frames = frames
-
-          vim.schedule(function()
-            dbg(string.format('poll: time=%d focused=%s changed=%s', t, tostring(ble_focused), tostring(time_changed)))
-
-            -- only rewrite buf when editor drives (safe, no feedback loop)
-            if not ble_focused and (time_changed or dim_changed) then
-              update_ble_buf()
-            end
-
-            -- only move cursor if .ble is NOT focused and state changed
-            if not ble_focused and (time_changed or dim_changed) then
-              if ble_buf and vim.api.nvim_buf_is_valid(ble_buf) then
-                local win = vim.fn.bufwinid(ble_buf)
-                if win ~= -1 then
-                  local lc = vim.api.nvim_buf_line_count(ble_buf)
-                  local row = math.min(t + 1, lc)
-                  local line = vim.api.nvim_buf_get_lines(ble_buf, row - 1, row, false)[1] or ''
-                  local col = dim_to_col(d or 0, line)
-                  moving = true
-                  vim.api.nvim_win_set_cursor(win, { row, col })
-                  dbg('poll moved cursor to line ' .. row .. ' col ' .. col)
-                  vim.schedule(function()
-                    moving = false
-                  end)
-                end
-              end
-            end
-
-            -- next poll only after this one fully processed
-            local timer = uv.new_timer()
-            timer:start(150, 0, function()
-              timer:close()
-              poll_loop()
-            end)
-          end)
-        else
-          local timer = uv.new_timer()
-          timer:start(150, 0, function()
-            timer:close()
-            poll_loop()
-          end)
-        end
-      else
-        -- EOF without terminator
-        c:close()
-        local timer = uv.new_timer()
-        timer:start(150, 0, function()
-          timer:close()
-          poll_loop()
-        end)
+        retry()
+        return
       end
+
+      buf = buf .. data
+      if not buf:find '%-%-%-\n' then
+        return
+      end
+      c:close()
+
+      local t = tonumber(buf:match 'current_time=(%d+)')
+      local d = tonumber(buf:match 'current_dim=(%d+)')
+      local fc = tonumber(buf:match 'frame_count=(%d+)')
+      local dc = tonumber(buf:match 'current_dim_count=(%d+)')
+      if t == nil then
+        retry()
+        return
+      end
+
+      -- latch: don't let a stale in-flight poll clobber a just-sent value
+      local time_changed, dim_changed
+
+      if last_sent_time == nil or t == last_sent_time then
+        time_changed = (t ~= state.current_time)
+        state.current_time = t
+        last_sent_time = nil
+      else
+        time_changed = false
+      end
+
+      if last_sent_dim == nil or (d ~= nil and d == last_sent_dim) then
+        dim_changed = (d ~= state.current_dim)
+        state.current_dim = d or state.current_dim
+        last_sent_dim = nil
+      else
+        dim_changed = false
+      end
+
+      if fc then
+        state.frame_count = fc
+      end
+      if dc then
+        state.dim_count = dc
+      end
+
+      -- frames: lines like  frame=<t>:<main>:<dim0>:<dim1>:...:owner=<n>
+      local frames = {}
+      for line in buf:gmatch '[^\n]+' do
+        local body = line:match '^frame=(.+)$'
+        if body then
+          -- strip owner off the end before the positional parse
+          local owner = body:match ':owner=(%w+)'
+          body = body:gsub(':owner=%w+$', '')
+
+          local fields = {}
+          for p in (body .. ':'):gmatch '([^:]*):' do
+            fields[#fields + 1] = p
+          end
+          local idx = tonumber(fields[1])
+          if idx ~= nil then
+            local main = fields[2]
+            local dims = {}
+            for i = 3, #fields do
+              dims[#dims + 1] = fields[i]
+            end
+            frames[idx + 1] = {
+              uid = (main and main ~= 'null') and main or nil,
+              dims = dims,
+              owner = (owner and owner ~= 'null') and tonumber(owner) or nil,
+            }
+          end
+        end
+      end
+      state.frames = frames
+
+      vim.schedule(function()
+        local sig = frames_sig()
+        if (not painted) or sig ~= last_sig then
+          update_ble_buf()
+          painted = true
+          last_sig = sig
+        end
+
+        retry()
+      end)
     end)
 
     c:write 'state\n'
@@ -288,69 +355,143 @@ local function poll_loop()
   end)
 end
 
--- ── play ──────────────────────────────────────────────────────────────────────
-
-local function stop_play()
-  if play_timer then
-    play_timer:stop()
-    play_timer:close()
-    play_timer = nil
-  end
-  playing = false
-  dbg 'play stopped'
-end
-
-local function start_play(fps)
-  if playing then
-    stop_play()
-    return
-  end
-  playing = true
-  fps = fps or 12
-  dbg('play start ' .. fps .. 'fps')
-  play_timer = uv.new_timer()
-  play_timer:start(0, math.floor(1000 / fps), function()
-    vim.schedule(function()
-      local next_t = state.current_time + 1
-      if next_t >= state.frame_count then
-        next_t = 0
-      end
-      state.current_time = next_t
-      cmd(string.format('frame:%d\n', next_t))
-    end)
-  end)
-end
-
--- ── cursor moved in .ble: user is driving, fire cmd, don't readback ───────────
+-- ── cursor moved: real user input only ────────────────────────────────────────
 local function on_cursor_moved()
-  if moving then
-    return
-  end
-  if not ble_focused then
+  if not ble_buf or not vim.api.nvim_buf_is_valid(ble_buf) then
     return
   end
   local win = vim.fn.bufwinid(ble_buf)
   if win == -1 then
     return
   end
+  if vim.api.nvim_get_current_win() ~= win then
+    return
+  end
+
   local cursor = vim.api.nvim_win_get_cursor(win)
+  if expect_cursor and cursor[1] == expect_cursor[1] and cursor[2] == expect_cursor[2] then
+    expect_cursor = nil
+    dbg('cursor: ignored own move at row ' .. cursor[1])
+    return
+  end
+  expect_cursor = nil
+
+  if not ble_focused then
+    ble_focused = true
+    cmd 'focus:lua\n'
+  end
+
   local row = cursor[1]
   local col = cursor[2]
   local t = row - 1
   local line = vim.api.nvim_buf_get_lines(ble_buf, row - 1, row, false)[1] or ''
-  local d = col_to_dim(col, line)
-  local time_changed = (t ~= state.current_time)
-  local dim_changed = (d ~= state.current_dim)
-  if time_changed then
+  local dd = col_to_dim(col, line)
+
+  -- resolve target dim: main-column click snaps to that row's owner lane,
+  -- a dim-column click uses that dim directly
+  local target_dim
+  if dd == 'main' then
+    local fr = state.frames[t + 1]
+    target_dim = (fr and fr.owner) or state.current_dim
+  else
+    target_dim = dd
+  end
+  if target_dim == nil then
+    target_dim = state.current_dim
+  end
+
+  if t ~= state.current_time or target_dim ~= state.current_dim then
     state.current_time = t
-    dbg(string.format('cursor cmd: frame:%d', t))
-    cmd(string.format('frame:%d\n', t))
+    state.current_dim = target_dim
+    last_sent_time = t
+    last_sent_dim = target_dim
+    cmd('goto:' .. t .. ':' .. target_dim .. '\n') -- ONE atomic message
   end
-  if dim_changed then
-    state.current_dim = d
-    dbg(string.format('cursor cmd: dim:%d', d))
-    cmd(string.format('dim:%d\n', d))
+end
+
+local function active_uid_at(t)
+  local fr = state.frames[t + 1]
+  return fr and fr.uid and tonumber(fr.uid) or nil
+end
+
+local function request(msg, on_reply)
+  local c = uv.new_tcp()
+  local buf = ''
+  c:connect(HOST, PORT, function(err)
+    if err then
+      c:close()
+      return
+    end
+    c:read_start(function(rerr, data)
+      if rerr or not data then
+        c:close()
+        vim.schedule(function()
+          on_reply(buf)
+        end)
+        return
+      end
+      buf = buf .. data
+      if buf:find '\n' then
+        c:close()
+        vim.schedule(function()
+          on_reply(buf)
+        end)
+      end
+    end)
+    c:write(msg)
+  end)
+end
+
+local function paste_uid()
+  if not M.clip then
+    dbg 'nothing yanked'
+    return
   end
+  local win = vim.fn.bufwinid(ble_buf)
+  local t = vim.api.nvim_win_get_cursor(win)[1] - 1
+  local parent = active_uid_at(t - 1) -- parent is the frame BEFORE the paste point
+  if not parent then
+    dbg('no parent at t=' .. (t - 1))
+    return
+  end
+  local dim = state.current_dim
+
+  local function go(force)
+    local suffix = force and ':force' or ''
+    request(string.format('connect:%d:%d:%d:%d%s\n', parent, dim, t, M.clip, suffix), function(reply)
+      local victim = reply:match 'conflict:(%d+)'
+      if victim and not force then
+        if vim.fn.confirm('overwrite uid ' .. victim .. '?', '&Yes\n&No', 2) == 1 then
+          go(true)
+        end
+      else
+        -- nudging it so it refreshes and shows it up, prob not necesary
+        state.current_time = t
+        state.current_dim = dim
+        last_sent_time = t
+        last_sent_dim = dim
+        cmd(string.format('goto:%d:%d\n', t, dim))
+      end
+    end)
+  end
+  go(false)
+end
+
+local function uid_under_cursor()
+  local win = vim.fn.bufwinid(ble_buf)
+  local cur = vim.api.nvim_win_get_cursor(win)
+  local row, col = cur[1], cur[2]
+  local line = vim.api.nvim_buf_get_lines(ble_buf, row - 1, row, false)[1] or ''
+  local fr = state.frames[row] -- row == t + 1
+  if not fr then
+    return nil
+  end
+  local dd = col_to_dim(col, line)
+  if dd == 'main' or dd == nil then
+    return fr.uid and tonumber(fr.uid) or nil
+  end
+  local v = fr.dims[dd + 1] -- dd is 0-based, dims is 1-based
+  return (v and v ~= 'null') and tonumber(v) or nil
 end
 
 -- ── attach ────────────────────────────────────────────────────────────────────
@@ -359,7 +500,9 @@ local function attach(bufnr)
     return
   end
   ble_buf = bufnr
-  dbg('attached buf ' .. bufnr)
+  painted = false
+  last_sig = nil
+  dbg('attached buf ' .. bufnr .. ' [VERSION col-fix-2]')
 
   vim.api.nvim_create_autocmd('CursorMoved', {
     buffer = bufnr,
@@ -371,7 +514,7 @@ local function attach(bufnr)
       if win ~= -1 and win == vim.api.nvim_get_current_win() then
         ble_focused = true
         cmd 'focus:lua\n'
-        dbg 'focus:lua'
+        dbg 'focus:lua (FocusGained)'
       end
     end,
   })
@@ -379,7 +522,7 @@ local function attach(bufnr)
     callback = function()
       ble_focused = false
       cmd 'focus:editor\n'
-      dbg 'focus:editor'
+      dbg 'focus:editor (FocusLost)'
     end,
   })
   vim.api.nvim_create_autocmd('WinEnter', {
@@ -399,16 +542,65 @@ local function attach(bufnr)
     end,
   })
 
-  -- keymaps (buffer-local)
   local opts = { buffer = bufnr, noremap = true, silent = true }
-  vim.keymap.set('n', '<localleader>p', function()
-    start_play(12)
+  vim.keymap.set('n', 'w', function()
+    cmd 'toggle_pin\n'
+    dbg 'toggle_pin'
   end, opts)
-  vim.keymap.set('n', '<localleader>P', function()
-    stop_play()
+  vim.keymap.set('n', '<localleader>n', function()
+    cmd 'newframe\n'
+    dbg 'newframe'
   end, opts)
-  vim.keymap.set('n', 'q', function()
-    stop_play()
+  vim.keymap.set('n', 'y', function()
+    M.clip = uid_under_cursor()
+    dbg('yank ' .. tostring(M.clip))
+  end, opts)
+  vim.keymap.set('n', '<M-d>', function() -- Alt-D; use '<M-d>' if your term sends Alt
+    cmd 'duplicate\n'
+    dbg 'duplicate'
+  end, opts)
+  vim.keymap.set('n', 'p', function()
+    paste_uid()
+  end, opts)
+
+  local function char_key(i)
+    return function()
+      cmd('char:' .. i .. '\n')
+      dbg('char ' .. i)
+    end
+  end
+  for i = 1, 9 do
+    vim.keymap.set('n', '<M-' .. i .. '>', char_key(i - 1), opts)
+  end
+  vim.keymap.set('n', '<M-0>', char_key(9), opts)
+  vim.keymap.set('n', '<M-=>', function()
+    cmd 'char:new\n'
+    dbg 'char new'
+  end, opts)
+  vim.keymap.set('n', '<localleader>gp', function()
+    cmd 'gameui:addpoint\n'
+    dbg 'gameui addpoint'
+  end, opts)
+  vim.keymap.set('n', '<localleader>gb', function()
+    cmd 'gameui:addbbox\n'
+    dbg 'gameui addbbox'
+  end, opts)
+  vim.keymap.set('n', '<localleader>gd', function()
+    cmd 'gameui:delete\n'
+    dbg 'gameui delete'
+  end, opts)
+
+  -- rename the selected element: fetch current label, prompt, send new
+  vim.keymap.set('n', '<localleader>gr', function()
+    request('gameui:getlabel\n', function(reply)
+      local cur = reply:match 'label:([^\n]*)' or ''
+      vim.ui.input({ prompt = 'Element label: ', default = cur }, function(input)
+        if input and #input > 0 then
+          cmd('gameui:rename:' .. input .. '\n')
+          dbg('gameui rename -> ' .. input)
+        end
+      end)
+    end)
   end, opts)
 
   poll_loop()
